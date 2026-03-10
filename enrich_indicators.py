@@ -12,9 +12,72 @@ import requests
 # ── Configuration ──────────────────────────────────────────────────────────────
 
 WB_API_BASE   = "https://api.worldbank.org/v2/indicator"
-API_BASE_URL  = "http://ollama.ollama-keda.svc.cluster.local:11434" #"http://ollama-keda.mobiusdtaas.ai"
+API_BASE_URL  = "http://ollama.ollama-keda.svc.cluster.local:11434"
 MODEL_NAME    = "gpt-oss:20b"
 REQUEST_DELAY = 0.3
+
+
+# ── ISIC Rev.4 Sections A–U ────────────────────────────────────────────────────
+
+ISIC_SECTIONS = {
+    "A": "Agriculture, Forestry and Fishing",
+    "B": "Mining and Quarrying",
+    "C": "Manufacturing",
+    "D": "Electricity, Gas, Steam and Air Conditioning Supply",
+    "E": "Water Supply, Sewerage, Waste Management and Remediation",
+    "F": "Construction",
+    "G": "Wholesale and Retail Trade; Repair of Motor Vehicles",
+    "H": "Transportation and Storage",
+    "I": "Accommodation and Food Service Activities",
+    "J": "Information and Communication",
+    "K": "Financial and Insurance Activities",
+    "L": "Real Estate Activities",
+    "M": "Professional, Scientific and Technical Activities",
+    "N": "Administrative and Support Service Activities",
+    "O": "Public Administration and Defence; Compulsory Social Security",
+    "P": "Education",
+    "Q": "Human Health and Social Work Activities",
+    "R": "Arts, Entertainment and Recreation",
+    "S": "Other Service Activities",
+    "T": "Activities of Households as Employers",
+    "U": "Activities of Extraterritorial Organisations and Bodies",
+}
+
+# WB topic → ISIC code mapping
+WB_TOPIC_TO_ISIC = {
+    "agriculture": "A",
+    "climate change": "E",
+    "economy": "K",
+    "education": "P",
+    "energy": "D",
+    "environment": "E",
+    "financial sector": "K",
+    "gender": "O",
+    "health": "Q",
+    "infrastructure": "F",
+    "labor": "N",
+    "labour": "N",
+    "poverty": "O",
+    "private sector": "K",
+    "public sector": "O",
+    "science": "M",
+    "social development": "Q",
+    "social protection": "Q",
+    "technology": "J",
+    "trade": "G",
+    "transport": "H",
+    "urban development": "F",
+    "water": "E",
+}
+
+
+def map_wb_topic_to_isic(topic_value: str) -> str:
+    """Map a World Bank topic string to the closest ISIC section code."""
+    lower = topic_value.lower().strip()
+    for keyword, code in WB_TOPIC_TO_ISIC.items():
+        if keyword in lower:
+            return code
+    return "S"   # fallback: Other Service Activities
 
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
@@ -25,12 +88,10 @@ def setup_logger(log_path: str) -> logging.Logger:
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
                             datefmt="%Y-%m-%d %H:%M:%S")
 
-    # File handler — full debug log (persists in pod volume / PVC)
     fh = logging.FileHandler(log_path, encoding="utf-8")
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(fmt)
 
-    # Console handler — info+ (visible in kubectl logs)
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.INFO)
     ch.setFormatter(fmt)
@@ -43,16 +104,11 @@ def setup_logger(log_path: str) -> logging.Logger:
 # ── Checkpoint helpers ─────────────────────────────────────────────────────────
 
 def checkpoint_path(output_path: str) -> str:
-    """e.g. enriched.json → enriched.checkpoint.json"""
     p = Path(output_path)
     return str(p.with_name(p.stem + ".checkpoint.json"))
 
 
 def load_checkpoint(ckpt_path: str, logger: logging.Logger) -> tuple:
-    """
-    Returns (already_enriched_list, next_index_to_process).
-    If no checkpoint exists returns ([], 0).
-    """
     p = Path(ckpt_path)
     if p.exists():
         try:
@@ -68,7 +124,6 @@ def load_checkpoint(ckpt_path: str, logger: logging.Logger) -> tuple:
 
 def save_checkpoint(ckpt_path: str, enriched: list, next_index: int,
                     logger: logging.Logger):
-    """Atomically write progress to checkpoint file."""
     tmp = ckpt_path + ".tmp"
     try:
         Path(tmp).write_text(
@@ -76,13 +131,12 @@ def save_checkpoint(ckpt_path: str, enriched: list, next_index: int,
                        indent=2, ensure_ascii=False),
             encoding="utf-8"
         )
-        Path(tmp).replace(Path(ckpt_path))   # atomic rename on POSIX
+        Path(tmp).replace(Path(ckpt_path))
     except Exception as e:
         logger.error(f"Failed to save checkpoint: {e}")
 
 
 def save_output(output_path: str, enriched: list, logger: logging.Logger):
-    """Write the final (or partial) output file."""
     try:
         Path(output_path).write_text(
             json.dumps(enriched, indent=2, ensure_ascii=False),
@@ -105,7 +159,7 @@ def check_model_exists(model_name: str, api_base_url: str) -> bool:
         response.raise_for_status()
         models = response.json().get("models", [])
         return any(m.get("name") == model_name for m in models)
-    except Exception as e:
+    except Exception:
         return False
 
 
@@ -138,6 +192,10 @@ def ensure_model_available(model_name: str, api_base_url: str,
 # ── World Bank API helper ──────────────────────────────────────────────────────
 
 def fetch_wb_metadata(indicator_id: str, logger: logging.Logger) -> dict:
+    """
+    Returns domain as ISIC code (e.g. "Q") and context as
+    "SubDomain – 2-3 line explanation" derived from the WB sourceNote.
+    """
     url = f"{WB_API_BASE}/{indicator_id}?format=json"
     try:
         resp = requests.get(url, timeout=10)
@@ -150,14 +208,26 @@ def fetch_wb_metadata(indicator_id: str, logger: logging.Logger) -> dict:
             and isinstance(data[1], list)
             and data[1]
         ):
-            indicator = data[1][0]
-            topics  = indicator.get("topics") or []
-            domain  = topics[0]["value"].strip() if topics else ""
-            context = indicator.get("sourceNote", "").strip()
+            indicator  = data[1][0]
+            topics     = indicator.get("topics") or []
+            topic_str  = topics[0]["value"].strip() if topics else ""
+            source_note = indicator.get("sourceNote", "").strip()
 
-            if domain or context:
-                logger.debug(f"  [WB API OK] domain='{domain}'")
-                return {"domain": domain, "context": context}
+            if topic_str or source_note:
+                isic_code   = map_wb_topic_to_isic(topic_str)
+                isic_label  = ISIC_SECTIONS.get(isic_code, "")
+
+                # Build context: "TopicName – first ~2 sentences of sourceNote"
+                sentences   = source_note.replace("  ", " ").split(". ")
+                short_note  = ". ".join(sentences[:2]).strip()
+                if short_note and not short_note.endswith("."):
+                    short_note += "."
+
+                sub_domain  = topic_str if topic_str else isic_label
+                context     = f"{sub_domain} – {short_note}" if short_note else sub_domain
+
+                logger.debug(f"  [WB API OK] ISIC={isic_code} topic='{topic_str}'")
+                return {"domain": isic_code, "context": context}
 
         logger.debug(f"  [WB API] empty response for {indicator_id}")
     except Exception as exc:
@@ -168,14 +238,26 @@ def fetch_wb_metadata(indicator_id: str, logger: logging.Logger) -> dict:
 
 # ── Deployed LLM fallback ──────────────────────────────────────────────────────
 
+ISIC_LIST_FOR_PROMPT = "\n".join(
+    f"  {code}: {label}" for code, label in ISIC_SECTIONS.items()
+)
+
 def fetch_llm_metadata(indicator_id: str, indicator_value: str,
                        logger: logging.Logger) -> dict:
     prompt = f"""You are a data analyst specialising in World Development Indicators (WDI).
 
-Given the indicator below, respond with ONLY a valid JSON object (no markdown, no extra text)
-containing exactly two keys:
-  "domain"  - the high-level subject area (e.g. "Health", "Education", "Poverty & Inequality")
-  "context" - one or two sentences explaining what the indicator measures
+Map the indicator below to the correct ISIC Rev.4 section and provide a short context.
+
+ISIC Rev.4 sections:
+{ISIC_LIST_FOR_PROMPT}
+
+Rules:
+- "domain" must be ONLY the single letter ISIC code (A through U) that best fits the indicator.
+- "context" must follow this exact format:
+    "<2-3 word sub-domain> – <2 to 3 sentence plain-English explanation of what the indicator measures>"
+  Example: "Maternal Health – Tracks deaths related to pregnancy and childbirth per 100,000 live births. Used to assess quality of reproductive healthcare and identify gaps in prenatal and obstetric services."
+
+Respond with ONLY a valid JSON object, no markdown, no extra text.
 
 Indicator ID   : {indicator_id}
 Indicator label: {indicator_value}
@@ -197,16 +279,22 @@ JSON response:"""
         elif "```" in raw_text:
             raw_text = raw_text.split("```")[1].split("```")[0]
 
-        result = json.loads(raw_text.strip())
-        domain  = result.get("domain", "").strip()
+        result  = json.loads(raw_text.strip())
+        domain  = result.get("domain", "").strip().upper()
         context = result.get("context", "").strip()
-        logger.debug(f"  [LLM OK] domain='{domain}'")
+
+        # Validate ISIC code
+        if domain not in ISIC_SECTIONS:
+            logger.warning(f"  [LLM] Invalid ISIC code '{domain}', defaulting to 'S'")
+            domain = "S"
+
+        logger.debug(f"  [LLM OK] ISIC={domain}")
         return {"domain": domain, "context": context}
 
     except Exception as exc:
         logger.error(f"  [LLM error] {indicator_id}: {exc}")
 
-    return {"domain": "", "context": ""}
+    return {"domain": "S", "context": ""}
 
 
 # ── Main enrichment loop ───────────────────────────────────────────────────────
@@ -218,17 +306,12 @@ def enrich_indicators(input_path: str, output_path: str,
     total = len(indicators)
     ckpt  = checkpoint_path(output_path)
 
-    # ── Resolve starting point ──────────────────────────────────────────────
     if start_index > 0:
-        # Explicit index given on CLI — honour it, but load any existing checkpoint
-        # data so we don't lose earlier results
         enriched, _ = load_checkpoint(ckpt, logger)
-        # Trim enriched to exactly start_index items in case it's ahead/behind
         enriched = enriched[:start_index]
         next_idx = start_index
         logger.info(f"Resuming from explicit index {start_index}")
     else:
-        # Auto-detect from checkpoint
         enriched, next_idx = load_checkpoint(ckpt, logger)
 
     if next_idx >= total:
@@ -236,16 +319,14 @@ def enrich_indicators(input_path: str, output_path: str,
         save_output(output_path, enriched, logger)
         return
 
-    logger.info(f"Total indicators: {total} | Starting at index: {next_idx} | Remaining: {total - next_idx}")
+    logger.info(f"Total: {total} | Start: {next_idx} | Remaining: {total - next_idx}")
 
-    # ── Model check ─────────────────────────────────────────────────────────
     logger.info("Checking model availability...")
     if not ensure_model_available(MODEL_NAME, API_BASE_URL, logger):
         logger.error("Model not available. Saving partial results and exiting.")
         save_output(output_path, enriched, logger)
         sys.exit(1)
 
-    # ── Graceful shutdown on SIGTERM (k8s pod eviction / OOMKill) ───────────
     def _handle_signal(signum, frame):
         logger.warning(f"Signal {signum} received — saving partial results before exit...")
         save_output(output_path, enriched, logger)
@@ -257,7 +338,6 @@ def enrich_indicators(input_path: str, output_path: str,
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT,  _handle_signal)
 
-    # ── Processing loop ──────────────────────────────────────────────────────
     try:
         for i in range(next_idx, total):
             current_idx = i
@@ -267,28 +347,28 @@ def enrich_indicators(input_path: str, output_path: str,
 
             logger.info(f"[{i}/{total - 1}] {ind_id} – {ind_value}")
 
-            # 1. World Bank API
             meta = fetch_wb_metadata(ind_id, logger)
             source = "worldbank_api"
 
-            # 2. LLM fallback
             if not meta:
                 logger.info(f"  → WB API empty, falling back to LLM...")
                 meta   = fetch_llm_metadata(ind_id, ind_value, logger)
                 source = "llm_fallback"
 
+            isic_code  = meta["domain"]
+            isic_label = ISIC_SECTIONS.get(isic_code, "")
+            logger.info(f"  → ISIC {isic_code}: {isic_label}")
+
             enriched.append({
                 "index":   i,
                 "id":      ind_id,
                 "value":   ind_value,
-                "domain":  meta["domain"],
+                "domain":  f"{isic_label}-{isic_code}",
                 "context": meta["context"],
                 "_source": source
             })
 
-            # Save checkpoint after every record
             save_checkpoint(ckpt, enriched, i + 1, logger)
-
             time.sleep(REQUEST_DELAY)
 
     except Exception as e:
@@ -298,9 +378,7 @@ def enrich_indicators(input_path: str, output_path: str,
         save_checkpoint(ckpt, enriched, current_idx, logger)
         sys.exit(1)
 
-    # ── All done ─────────────────────────────────────────────────────────────
     save_output(output_path, enriched, logger)
-    # Clean up checkpoint now that output is complete
     try:
         Path(ckpt).unlink(missing_ok=True)
         logger.info("Checkpoint file removed (run complete)")
@@ -314,7 +392,7 @@ def enrich_indicators(input_path: str, output_path: str,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Enrich WDI indicators with domain and context."
+        description="Enrich WDI indicators with ISIC domain and context."
     )
     parser.add_argument("input",
                         help="Path to input JSON file (list of {id, value} dicts)")
