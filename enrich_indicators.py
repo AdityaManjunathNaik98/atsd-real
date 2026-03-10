@@ -12,7 +12,7 @@ import requests
 # ── Configuration ──────────────────────────────────────────────────────────────
 
 WB_API_BASE   = "https://api.worldbank.org/v2/indicator"
-API_BASE_URL  = "http://ollama-keda.mobiusdtaas.ai"
+API_BASE_URL  = "http://ollama.ollama-keda.svc.cluster.local:11434" #"http://ollama-keda.mobiusdtaas.ai"
 MODEL_NAME    = "gpt-oss:20b"
 REQUEST_DELAY = 0.3
 
